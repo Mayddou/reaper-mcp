@@ -35,8 +35,6 @@ describe('meter tools', () => {
         trackIndex: 0,
         peakL: -6.2,
         peakR: -5.8,
-        rmsL: -12.1,
-        rmsR: -11.9,
       };
 
       mockedSendCommand.mockResolvedValue({

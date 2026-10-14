@@ -3,15 +3,19 @@ desc:MCP Correlation Meter
 // Measures L/R correlation coefficient and stereo width via M/S decomposition.
 // Writes results to shared memory (gmem) so the Lua bridge can read them.
 //
-// gmem layout:
-//   gmem[0] = correlation coefficient (-1.0 = out of phase, 0 = uncorrelated, +1.0 = mono)
-//   gmem[1] = stereo width (0.0 = mono, 1.0 = normal stereo, 2.0 = very wide)
-//   gmem[2] = mid level (dB)
-//   gmem[3] = side level (dB)
+// Each instance writes to its own slot so several tracks can be metered at once.
+// gmem layout (per track slot):
+//   base = track_slot * 8
+//   gmem[base+0] = correlation coefficient (-1.0 = out of phase, 0 = uncorrelated, +1.0 = mono)
+//   gmem[base+1] = stereo width (0.0 = mono, 1.0 = normal stereo, 2.0 = very wide)
+//   gmem[base+2] = mid level (dB)
+//   gmem[base+3] = side level (dB)
+//   gmem[base+4] = measurement duration (seconds since last reset, 0 = no data yet)
 
 options:gmem=MCPCorrelationMeter
 
 slider1:window_ms=300<50,2000,10>Window (ms)
+slider2:track_slot=0<0,1023,1>Track Slot
 
 @init
   // Ring buffer for L, R, L*R, L*L, R*R over sliding window
@@ -51,11 +55,14 @@ slider1:window_ms=300<50,2000,10>Window (ms)
     sum_ll = 0; sum_rr = 0; sum_lr = 0;
     sum_mm = 0; sum_ss = 0;
     buf_pos = 0;
+    sample_count = 0;
     needs_init = 0;
-    gmem[0] = 0;
-    gmem[1] = 1;
-    gmem[2] = -150;
-    gmem[3] = -150;
+    base = floor(track_slot + 0.5) * 8;
+    gmem[base+0] = 0;
+    gmem[base+1] = 1;
+    gmem[base+2] = -150;
+    gmem[base+3] = -150;
+    gmem[base+4] = 0;
   );
 
   l = spl0;
@@ -94,6 +101,7 @@ slider1:window_ms=300<50,2000,10>Window (ms)
 
   buf_pos += 1;
   buf_pos >= buf_size ? buf_pos = 0;
+  sample_count += 1;
 
   // Update gmem every 512 samples (~86 Hz at 44.1kHz)
   (buf_pos % 512) == 0 ? (
@@ -135,10 +143,11 @@ slider1:window_ms=300<50,2000,10>Window (ms)
       sum_ss > 0 ? width = 2.0 : width = 0;
     );
 
-    gmem[0] = corr;
-    gmem[1] = width;
-    gmem[2] = mid_db;
-    gmem[3] = side_db;
+    gmem[base+0] = corr;
+    gmem[base+1] = width;
+    gmem[base+2] = mid_db;
+    gmem[base+3] = side_db;
+    gmem[base+4] = sample_count / srate;
   );
 
   // Pass audio through unmodified

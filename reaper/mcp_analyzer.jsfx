@@ -3,161 +3,135 @@ desc:MCP Spectrum Analyzer
 // Writes frequency bin magnitudes (in dB) to shared memory (gmem)
 // so the Lua bridge can read them and pass to the MCP server.
 //
-// gmem layout:
-//   gmem[0] = bin count (fft_size / 2)
-//   gmem[1] = peak dB
-//   gmem[2] = RMS dB
-//   gmem[3 .. 3+bin_count-1] = magnitude in dB per frequency bin
+// Each instance writes to its own slot so several tracks can be metered at once.
+// gmem layout (per track slot):
+//   base = track_slot * 4104
+//   gmem[base+0] = bin count (fft_size / 2)
+//   gmem[base+1] = peak dB (max |L|,|R| over the last FFT frame)
+//   gmem[base+2] = RMS dB (L+R power over the last FFT frame)
+//   gmem[base+3] = sample rate the analyzer runs at
+//   gmem[base+4] = FFT frames analysed since last reset (0 = no data yet)
+//   gmem[base+5 .. base+5+bin_count-1] = magnitude in dB per frequency bin
+//     (L/R power average; calibrated so a sine of amplitude A reads 20*log10(A))
 
 options:gmem=MCPAnalyzer
 
 slider1:fft_size_slider=4096<512,8192,1>FFT Size
 slider2:window_type=1<0,3,1{Rectangular,Hann,Hamming,Blackman-Harris}>Window Function
 slider3:smoothing=0.8<0,0.99,0.01>Smoothing
+slider4:track_slot=0<0,1023,1>Track Slot
 
 @init
-  // Allocate memory blocks
-  fft_buf = 0;              // FFT input buffer
-  window_buf = 16384;       // Window function
-  mag_buf = 32768;          // Magnitude accumulator (smoothed)
-  work_buf = 49152;         // Working buffer for FFT
+  SLOT_STRIDE = 4104;
+  // Memory map (fft_real buffers must not cross a 65536 boundary)
+  window_buf = 0;          // window function (<= 8192)
+  in_l = 8192;             // input ring, left
+  in_r = 16384;            // input ring, right
+  mag_buf = 24576;         // smoothed magnitudes in dB (<= 4096)
+  work_l = 32768;          // FFT work buffer, left
+  work_r = 49152;          // FFT work buffer, right
 
-  fft_size = 4096;
-  fft_pos = 0;
-  bin_count = fft_size / 2;
+  fft_size = 0;            // forces setup in @slider
 
-  // Pre-compute window function
   function compute_window(size, wtype) (
     i = 0;
+    window_sum = 0;
     loop(size,
-      wtype == 0 ? ( // Rectangular
+      wtype == 0 ? (
         window_buf[i] = 1.0;
-      ) :
-      wtype == 1 ? ( // Hann
+      ) : wtype == 1 ? (
         window_buf[i] = 0.5 * (1.0 - cos(2.0 * $pi * i / (size - 1)));
-      ) :
-      wtype == 2 ? ( // Hamming
+      ) : wtype == 2 ? (
         window_buf[i] = 0.54 - 0.46 * cos(2.0 * $pi * i / (size - 1));
-      ) :
-      ( // Blackman-Harris
+      ) : (
         window_buf[i] = 0.35875
           - 0.48829 * cos(2.0 * $pi * i / (size - 1))
           + 0.14128 * cos(4.0 * $pi * i / (size - 1))
           - 0.01168 * cos(6.0 * $pi * i / (size - 1));
       );
+      window_sum += window_buf[i];
       i += 1;
     );
   );
 
-  compute_window(fft_size, window_type);
-
-  // Initialize smoothed magnitude buffer to -150 dB
-  i = 0;
-  loop(bin_count,
-    mag_buf[i] = -150.0;
-    i += 1;
+  function reset_analysis() (
+    base = floor(track_slot + 0.5) * SLOT_STRIDE;
+    fft_pos = 0;
+    frames = 0;
+    peak_val = 0;
+    rms_sum = 0;
+    rms_count = 0;
+    gmem[base+0] = bin_count;
+    gmem[base+1] = -150;
+    gmem[base+2] = -150;
+    gmem[base+3] = srate;
+    gmem[base+4] = 0;
   );
-
-  peak_val = 0;
-  rms_sum = 0;
-  rms_count = 0;
 
 @slider
-  new_fft_size = slider1;
-  // Snap to valid FFT sizes
-  new_fft_size <= 512 ? new_fft_size = 512 :
-  new_fft_size <= 1024 ? new_fft_size = 1024 :
-  new_fft_size <= 2048 ? new_fft_size = 2048 :
-  new_fft_size <= 4096 ? new_fft_size = 4096 :
-  new_fft_size = 8192;
-
-  new_fft_size != fft_size ? (
-    fft_size = new_fft_size;
-    bin_count = fft_size / 2;
-    fft_pos = 0;
-    compute_window(fft_size, window_type);
-    // Reset smoothed magnitudes
-    i = 0;
-    loop(bin_count,
-      mag_buf[i] = -150.0;
-      i += 1;
-    );
-  );
-
+  // Snap to a power of two between 512 and 8192
+  fft_size = 2 ^ floor(log(max(512, min(8192, fft_size_slider))) / log(2) + 0.5);
+  bin_count = fft_size / 2;
   compute_window(fft_size, window_type);
+  reset_analysis();
 
 @sample
-  // Mix to mono and accumulate into FFT buffer
-  mono = (spl0 + spl1) * 0.5;
+  l = spl0;
+  r = spl1;
 
-  // Track peak and RMS
-  abs_mono = abs(mono);
-  abs_mono > peak_val ? peak_val = abs_mono;
-  rms_sum += mono * mono;
-  rms_count += 1;
+  abs(l) > peak_val ? peak_val = abs(l);
+  abs(r) > peak_val ? peak_val = abs(r);
+  rms_sum += l * l + r * r;
+  rms_count += 2;
 
-  // Apply window and store in FFT buffer
-  fft_buf[fft_pos] = mono * window_buf[fft_pos];
-
+  in_l[fft_pos] = l * window_buf[fft_pos];
+  in_r[fft_pos] = r * window_buf[fft_pos];
   fft_pos += 1;
 
-  // When buffer is full, perform FFT and write to gmem
   fft_pos >= fft_size ? (
-    // Copy to work buffer for FFT (real FFT needs 2x size)
-    memcpy(work_buf, fft_buf, fft_size);
+    memcpy(work_l, in_l, fft_size);
+    memcpy(work_r, in_r, fft_size);
+    fft_real(work_l, fft_size);
+    fft_real(work_r, fft_size);
+    fft_permute(work_l, fft_size / 2);
+    fft_permute(work_r, fft_size / 2);
 
-    // Perform real FFT
-    fft_real(work_buf, fft_size);
-
-    // Calculate magnitudes and write to gmem with smoothing
-    smooth = smoothing;
-    inv_smooth = 1.0 - smooth;
-    scale = 2.0 / fft_size;
+    // Amplitude calibration: fft_real bin magnitude = A * window_sum for a sine of
+    // amplitude A, so dividing by window_sum makes a sine read its peak level
+    scale = 1.0 / window_sum;
+    smooth = frames == 0 ? 0 : smoothing; // first frame unsmoothed (no -150 dB start bias)
 
     i = 0;
     loop(bin_count,
-      // Real FFT output: DC at [0], Nyquist at [1], then pairs [2i, 2i+1]
       i == 0 ? (
-        re = work_buf[0];
-        im = 0;
-      ) : i == bin_count ? (
-        re = work_buf[1];
-        im = 0;
+        pl = work_l[0] * work_l[0];
+        pr = work_r[0] * work_r[0];
+        dc_scale = 0.5; // DC has no mirrored negative-frequency half
       ) : (
-        re = work_buf[i * 2];
-        im = work_buf[i * 2 + 1];
+        pl = work_l[i * 2] * work_l[i * 2] + work_l[i * 2 + 1] * work_l[i * 2 + 1];
+        pr = work_r[i * 2] * work_r[i * 2] + work_r[i * 2 + 1] * work_r[i * 2 + 1];
+        dc_scale = 1;
       );
-
-      magnitude = sqrt(re * re + im * im) * scale;
+      magnitude = sqrt((pl + pr) * 0.5) * scale * dc_scale;
       magnitude < 0.000001 ? magnitude = 0.000001; // floor at -120 dB
       mag_db = 20.0 * log10(magnitude);
 
-      // Apply smoothing
-      mag_buf[i] = smooth * mag_buf[i] + inv_smooth * mag_db;
-
-      // Write to gmem
-      gmem[3 + i] = mag_buf[i];
-
+      mag_buf[i] = smooth * mag_buf[i] + (1 - smooth) * mag_db;
+      gmem[base + 5 + i] = mag_buf[i];
       i += 1;
     );
 
-    // Write metadata to gmem
-    gmem[0] = bin_count;
-
-    // Peak dB
     peak_val < 0.000001 ? peak_val = 0.000001;
-    gmem[1] = 20.0 * log10(peak_val);
+    rms_val = rms_count > 0 ? sqrt(rms_sum / rms_count) : 0;
+    rms_val < 0.000001 ? rms_val = 0.000001;
 
-    // RMS dB
-    rms_count > 0 ? (
-      rms_val = sqrt(rms_sum / rms_count);
-      rms_val < 0.000001 ? rms_val = 0.000001;
-      gmem[2] = 20.0 * log10(rms_val);
-    ) : (
-      gmem[2] = -150.0;
-    );
+    frames += 1;
+    gmem[base+0] = bin_count;
+    gmem[base+1] = 20.0 * log10(peak_val);
+    gmem[base+2] = 20.0 * log10(rms_val);
+    gmem[base+3] = srate;
+    gmem[base+4] = frames;
 
-    // Reset accumulators
     peak_val = 0;
     rms_sum = 0;
     rms_count = 0;

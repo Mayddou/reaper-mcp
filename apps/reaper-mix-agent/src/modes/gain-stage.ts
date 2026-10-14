@@ -45,7 +45,7 @@ prevents internal overloads, and gives the mix bus 6–10 dB of headroom.
    params:
      trackIndex: N
    \`\`\`
-   Record peak and RMS (dBFS) for each track.
+   Record peak (dBFS) for each track; use read_track_crest for RMS.
 
 5. **Calculate gain adjustments**
    Formula: \`gain_dB = -18 - current_average_dBFS\`

@@ -863,62 +863,12 @@ function handlers.read_track_meters(params)
   local peak_l = reaper.Track_GetPeakInfo(track, 0) -- channel 0 = left
   local peak_r = reaper.Track_GetPeakInfo(track, 1) -- channel 1 = right
 
-  -- RMS is available via D_VOL peak hold with mode flags
-  -- For simplicity, use peak values (RMS requires more complex metering)
+  -- No RMS here: Track_GetPeakInfo only reports RMS/loudness when the track's VU
+  -- meter mode is switched, which would modify the session. Use read_track_crest.
   return {
     trackIndex = idx,
     peakL = to_db(peak_l),
     peakR = to_db(peak_r),
-    rmsL = to_db(peak_l * 0.707), -- approximate RMS from peak
-    rmsR = to_db(peak_r * 0.707),
-  }
-end
-
--- Forward declaration: defined further below (line ~1618). Declared here so the
--- earlier handlers.read_track_spectrum can capture it as an upvalue.
-local ensure_jsfx_on_track
-
-function handlers.read_track_spectrum(params)
-  local idx = params.trackIndex
-  if not idx then return nil, "trackIndex required" end
-
-  local track = reaper.GetTrack(0, idx)
-  if not track then return nil, "Track " .. idx .. " not found" end
-
-  -- Find or auto-insert analyzer (uses MCP Meters container if available)
-  local analyzer_idx, err = ensure_jsfx_on_track(track, MCP_ANALYZER_FX_NAME)
-  if not analyzer_idx then
-    return nil, err or "MCP Spectrum Analyzer JSFX not found. Run 'reaper-mcp setup' to install it."
-  end
-
-  -- Read spectrum data from gmem
-  -- JSFX writes: gmem[0] = bin_count, gmem[1] = peak_db, gmem[2] = rms_db, gmem[3..] = bins
-  reaper.gmem_attach("MCPAnalyzer")
-
-  local bin_count = reaper.gmem_read(0)
-  if bin_count <= 0 then
-    return nil, "Spectrum analyzer not producing data yet. Ensure audio is playing."
-  end
-
-  local peak_db = reaper.gmem_read(1)
-  local rms_db = reaper.gmem_read(2)
-  local sr = reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false)
-  local fft_size = params.fftSize or 4096
-
-  local bins = {}
-  for i = 0, bin_count - 1 do
-    bins[#bins + 1] = reaper.gmem_read(3 + i)
-  end
-
-  return {
-    trackIndex = idx,
-    fftSize = fft_size,
-    sampleRate = sr,
-    binCount = bin_count,
-    frequencyResolution = sr / fft_size,
-    peakDb = peak_db,
-    rmsDb = rms_db,
-    bins = bins,
   }
 end
 
@@ -1537,136 +1487,135 @@ local MCP_LUFS_METER_FX_NAME        = "reaper-mcp/mcp_lufs_meter"
 local MCP_CORRELATION_METER_FX_NAME = "reaper-mcp/mcp_correlation_meter"
 local MCP_CREST_FACTOR_FX_NAME      = "reaper-mcp/mcp_crest_factor"
 local MCP_MIDI_EMITTER_FX_NAME      = "reaper-mcp/mcp_midi_emitter"
--- Lua pattern matching the JSFX `desc:` line — that's what TrackFX_GetFXName
--- returns, not the on-disk path. Every MCP JSFX starts its desc with "MCP ".
--- (The outer container is renamed to "MCP Meters", but this prefix is only used
--- to identify the JSFX *inside* a container, so collisions are not possible.)
-local MCP_FX_PREFIX                 = "MCP "
+-- Every MCP JSFX lives under Effects/reaper-mcp/, so its fx_ident starts with this.
+local MCP_JSFX_DIR                  = "reaper-mcp/"
+-- Meters write to gmem at track_slot * stride; slot = track index (slider max 1023).
+local MAX_METER_SLOT                = 1023
 
--- Per-track cache of MCP container FX index to avoid rescanning on every read.
--- Keyed by track pointer (userdata), value is container FX index or false (no container).
--- Invalidated when the FX chain changes (checked via TrackFX_GetCount).
-local container_cache = {}
+-- True if FX `fx` on `track` is the JSFX at `fx_name` (an Effects-relative path).
+-- Matches on fx_ident (the on-disk path), which survives renames — never on the
+-- display name, which the user can change and other plugins can share.
+local function fx_is_jsfx(track, fx, fx_name)
+  local ok, ident = reaper.TrackFX_GetNamedConfigParm(track, fx, "fx_ident")
+  return ok and ident ~= nil and ident:find(fx_name, 1, true) ~= nil
+end
 
--- Find or create the MCP Meters container on a track.
--- Uses REAPER 7.06+ container_item.X API. Returns container FX index, or nil
--- if containers are not supported (REAPER < 7.06).
-local function find_or_create_mcp_container(track)
-  -- Check cache first
-  local cache_entry = container_cache[tostring(track)]
-  if cache_entry then
-    local cached_idx, cached_fx_count = cache_entry[1], cache_entry[2]
-    local current_fx_count = reaper.TrackFX_GetCount(track)
-    if current_fx_count == cached_fx_count then
-      if cached_idx == false then return nil end  -- cached negative result
-      return cached_idx
-    end
-    -- FX count changed — invalidate cache
-    container_cache[tostring(track)] = nil
+-- Address of the first JSFX `fx_name` inside container `c`, or nil.
+local function find_jsfx_in_container(track, c, fx_name)
+  local ok, count_str = reaper.TrackFX_GetNamedConfigParm(track, c, "container_count")
+  if not ok then return nil end
+  for i = 0, (tonumber(count_str) or 0) - 1 do
+    local _, addr_str = reaper.TrackFX_GetNamedConfigParm(track, c, "container_item." .. i)
+    local addr = tonumber(addr_str)
+    if addr and fx_is_jsfx(track, addr, fx_name) then return addr end
   end
+  return nil
+end
 
-  local fx_count = reaper.TrackFX_GetCount(track)
-
-  -- Search for existing container that holds MCP JSFX
-  for i = 0, fx_count - 1 do
-    local _, name = reaper.TrackFX_GetFXName(track, i)
-    if name and (name:find("Container") or name:find("MCP Meters")) then
-      local ok, count_str = reaper.TrackFX_GetNamedConfigParm(track, i, "container_count")
-      if ok then
-        local count = tonumber(count_str) or 0
-        for j = 0, count - 1 do
-          local _, addr_str = reaper.TrackFX_GetNamedConfigParm(track, i, "container_item." .. j)
-          local addr = tonumber(addr_str)
-          if addr then
-            local _, fx_name = reaper.TrackFX_GetFXName(track, addr)
-            if fx_name and fx_name:find(MCP_FX_PREFIX) then
-              -- Found our container — cache and return
-              container_cache[tostring(track)] = { i, fx_count }
-              return i
-            end
-          end
-        end
+-- Find or create the MCP Meters container on a track (REAPER 7.06+ container API).
+-- Returns its top-level FX index, or nil if containers are not supported.
+-- No caching: indices shift whenever the user edits the chain, and a stale index
+-- could point at one of their plugins.
+local function find_or_create_mcp_container(track)
+  for i = 0, reaper.TrackFX_GetCount(track) - 1 do
+    local ok = reaper.TrackFX_GetNamedConfigParm(track, i, "container_count")
+    if ok then
+      local _, name = reaper.TrackFX_GetFXName(track, i)
+      if (name and name:find("MCP Meters", 1, true)) or find_jsfx_in_container(track, i, MCP_JSFX_DIR) then
+        return i
       end
     end
   end
 
-  -- No existing MCP container — create one at end of chain
+  -- No MCP container yet — create one at the end of the chain
   local idx = reaper.TrackFX_AddByName(track, "Container", false, -1)
-  if idx < 0 then
-    -- Container FX not available (REAPER < 7)
-    container_cache[tostring(track)] = { false, fx_count }
-    return nil
-  end
+  if idx < 0 then return nil end  -- Container FX not available (REAPER < 7)
 
-  -- Name the container "MCP Meters" for easy identification
-  reaper.TrackFX_SetNamedConfigParm(track, idx, "renamed_name", "MCP Meters")
-
-  -- Verify container API works (confirms REAPER 7.06+)
-  local ok = reaper.TrackFX_GetNamedConfigParm(track, idx, "container_count")
-  if not ok then
-    -- API not available — remove the container and fall back
+  if not reaper.TrackFX_GetNamedConfigParm(track, idx, "container_count") then
+    -- container_item API missing (REAPER < 7.06) — remove the container and fall back
     reaper.TrackFX_Delete(track, idx)
-    container_cache[tostring(track)] = { false, fx_count }
     return nil
   end
-
-  -- Cache the new container (fx_count + 1 because we just added the container)
-  container_cache[tostring(track)] = { idx, reaper.TrackFX_GetCount(track) }
+  reaper.TrackFX_SetNamedConfigParm(track, idx, "renamed_name", "MCP Meters")
   return idx
 end
 
--- Helper: find or auto-insert a named JSFX on a track.
--- Tries to place inside an "MCP Meters" FX Container (REAPER 7.06+).
--- Falls back to direct insertion on older REAPER versions.
--- Returns the FX index (possibly container-addressed) on success, or nil + error.
-function ensure_jsfx_on_track(track, fx_name)
-  -- Try container approach first (REAPER 7.06+)
-  local container_idx = find_or_create_mcp_container(track)
-  if container_idx then
-    local ok, count_str = reaper.TrackFX_GetNamedConfigParm(track, container_idx, "container_count")
-    local count = tonumber(count_str) or 0
+-- Find or auto-insert a named JSFX on a track, inside the "MCP Meters" container
+-- when supported (REAPER 7.06+), else at the end of the top-level chain.
+-- Returns an FX index/address that has been verified to be `fx_name`, or nil + error.
+local function ensure_jsfx_on_track(track, fx_name)
+  local c = find_or_create_mcp_container(track)
+  if c then
+    local addr = find_jsfx_in_container(track, c, fx_name)
+    if addr then return addr end
 
-    -- Search inside container for existing JSFX
-    for i = 0, count - 1 do
-      local _, addr_str = reaper.TrackFX_GetNamedConfigParm(track, container_idx, "container_item." .. i)
-      local addr = tonumber(addr_str)
-      if addr then
-        local _, name = reaper.TrackFX_GetFXName(track, addr)
-        if name and name:find(fx_name, 1, true) then
-          return addr  -- Found inside container
-        end
-      end
-    end
-
-    -- Not found — insert inside container
-    -- Use legacy addressing: 0x2000000 + (1-based slot) * (top_chain_count + 1) + (1-based container pos)
-    local top_count = reaper.TrackFX_GetCount(track)
-    local slot = count + 1  -- 1-based, next empty slot
-    local container_pos = container_idx + 1  -- 1-based
-    local insert_addr = 0x2000000 + slot * (top_count + 1) + container_pos
-    local new_idx = reaper.TrackFX_AddByName(track, fx_name, false, insert_addr)
-    if new_idx >= 0 then
-      -- Invalidate cache since FX count changed
-      container_cache[tostring(track)] = nil
-      return new_idx
-    end
-    -- Container insertion failed — fall through to direct
+    -- Append inside the container: 0x2000000 + (1-based slot) * (top count + 1) + (1-based container pos)
+    local _, count_str = reaper.TrackFX_GetNamedConfigParm(track, c, "container_count")
+    local slot = (tonumber(count_str) or 0) + 1
+    local insert_addr = 0x2000000 + slot * (reaper.TrackFX_GetCount(track) + 1) + (c + 1)
+    reaper.TrackFX_AddByName(track, fx_name, false, -1000 - insert_addr)
+    -- AddByName's return value is the position *inside* the container, not an address
+    -- other TrackFX_* calls accept (using it hit the user's top-level plugins), so
+    -- resolve the real address by scanning the container again.
+    addr = find_jsfx_in_container(track, c, fx_name)
+    if addr then return addr end
+    return nil, "Failed to insert " .. fx_name .. " into the MCP Meters container. Run 'reaper-mcp setup' to install it."
   end
 
-  -- Fallback: direct insertion (REAPER < 7.06 or container failed)
-  local fx_count = reaper.TrackFX_GetCount(track)
-  for i = 0, fx_count - 1 do
-    local _, name = reaper.TrackFX_GetFXName(track, i)
-    if name and name:find(fx_name, 1, true) then
-      return i
-    end
+  -- Fallback: top-level chain (REAPER < 7.06)
+  for i = 0, reaper.TrackFX_GetCount(track) - 1 do
+    if fx_is_jsfx(track, i, fx_name) then return i end
   end
   local idx = reaper.TrackFX_AddByName(track, fx_name, false, -1)
-  if idx < 0 then
-    return nil, fx_name .. " JSFX not found. Run 'reaper-mcp setup' to install it."
-  end
-  return idx
+  if idx >= 0 and fx_is_jsfx(track, idx, fx_name) then return idx end
+  return nil, fx_name .. " JSFX not found. Run 'reaper-mcp setup' to install it."
 end
+
+local function find_param_by_name(track, fx, param_name)
+  for p = 0, reaper.TrackFX_GetNumParams(track, fx) - 1 do
+    local _, name = reaper.TrackFX_GetParamName(track, fx, p)
+    if name == param_name then return p end
+  end
+  return nil
+end
+
+-- Set a named slider on an MCP JSFX. Refuses unless `fx` is verified to be `fx_name`,
+-- so a wrong index can never write into a user's plugin. Returns true if the value changed.
+local function set_mcp_jsfx_slider(track, fx, fx_name, param_name, value)
+  if not fx_is_jsfx(track, fx, fx_name) then
+    return nil, "Refusing to set '" .. param_name .. "': FX " .. fx .. " is not " .. fx_name
+  end
+  local p = find_param_by_name(track, fx, param_name)
+  if not p then return nil, fx_name .. " has no '" .. param_name .. "' slider" end
+  if math.abs(reaper.TrackFX_GetParam(track, fx, p) - value) < 0.5 then return false end
+  reaper.TrackFX_SetParam(track, fx, p, value)  -- JSFX sliders take their native value
+  return true
+end
+
+-- Insert/find an MCP meter on a track and point it at this track's gmem slot.
+-- Returns fx, nil, slot_changed — slot_changed means the meter was just (re)assigned
+-- and its slot holds no data for this track yet.
+local function ensure_meter(track, track_idx, fx_name)
+  if track_idx > MAX_METER_SLOT then
+    return nil, "MCP meters support track indices 0-" .. MAX_METER_SLOT
+  end
+  local fx, err = ensure_jsfx_on_track(track, fx_name)
+  if not fx then return nil, err end
+
+  if not find_param_by_name(track, fx, "Track Slot") then
+    -- Instance compiled from an older JSFX without per-track slots (e.g. the bridge was
+    -- reloaded without reopening the project). It is ours — replace it.
+    reaper.TrackFX_Delete(track, fx)
+    fx, err = ensure_jsfx_on_track(track, fx_name)
+    if not fx then return nil, err end
+  end
+
+  local changed, set_err = set_mcp_jsfx_slider(track, fx, fx_name, "Track Slot", track_idx)
+  if changed == nil then return nil, set_err end
+  return fx, nil, changed
+end
+
+local NOT_READY_HINT = "Meter was just assigned to this track; play audio and read again."
 
 function handlers.read_track_lufs(params)
   local idx = params.trackIndex
@@ -1675,34 +1624,28 @@ function handlers.read_track_lufs(params)
   local track = reaper.GetTrack(0, idx)
   if not track then return nil, "Track " .. idx .. " not found" end
 
-  local fx_idx, err = ensure_jsfx_on_track(track, MCP_LUFS_METER_FX_NAME)
-  if not fx_idx then return nil, err end
+  local fx, err, slot_changed = ensure_meter(track, idx, MCP_LUFS_METER_FX_NAME)
+  if not fx then return nil, err end
 
-  -- Set the track_slot parameter so this instance writes to a unique gmem offset
-  local desired_slot = idx / 127
-  local current_slot = reaper.TrackFX_GetParam(track, fx_idx, 1)
-  if math.abs(current_slot - desired_slot) > 0.001 then
-    reaper.TrackFX_SetParam(track, fx_idx, 1, desired_slot)
+  if params.reset then
+    -- Restart integration (e.g. right after playback starts) so silence before
+    -- the measurement window doesn't dilute integrated loudness.
+    local _, reset_err = set_mcp_jsfx_slider(track, fx, MCP_LUFS_METER_FX_NAME, "Reset Measurement", 1)
+    if reset_err then return nil, reset_err end
+    slot_changed = true
   end
 
-  -- Read from gmem (JSFX writes here from @sample)
   reaper.gmem_attach("MCPLufsMeter")
-
   local base = idx * 8
-  local integrated  = reaper.gmem_read(base + 0)
-  local short_term  = reaper.gmem_read(base + 1)
-  local momentary   = reaper.gmem_read(base + 2)
-  local true_peak_l = reaper.gmem_read(base + 3)
-  local true_peak_r = reaper.gmem_read(base + 4)
-  local duration    = reaper.gmem_read(base + 5)
+  local duration = slot_changed and 0 or reaper.gmem_read(base + 5)
 
   return {
     trackIndex  = idx,
-    integrated  = integrated,
-    shortTerm   = short_term,
-    momentary   = momentary,
-    truePeakL   = true_peak_l,
-    truePeakR   = true_peak_r,
+    integrated  = reaper.gmem_read(base + 0),
+    shortTerm   = reaper.gmem_read(base + 1),
+    momentary   = reaper.gmem_read(base + 2),
+    truePeakL   = reaper.gmem_read(base + 3),
+    truePeakR   = reaper.gmem_read(base + 4),
     duration    = duration,
     measuring   = duration > 0,
   }
@@ -1715,23 +1658,21 @@ function handlers.read_track_correlation(params)
   local track = reaper.GetTrack(0, idx)
   if not track then return nil, "Track " .. idx .. " not found" end
 
-  local fx_idx, err = ensure_jsfx_on_track(track, MCP_CORRELATION_METER_FX_NAME)
-  if not fx_idx then return nil, err end
+  local fx, err, slot_changed = ensure_meter(track, idx, MCP_CORRELATION_METER_FX_NAME)
+  if not fx then return nil, err end
 
-  -- Read from gmem (JSFX writes here from @sample)
   reaper.gmem_attach("MCPCorrelationMeter")
-
-  local correlation  = reaper.gmem_read(0)
-  local stereo_width = reaper.gmem_read(1)
-  local mid_level    = reaper.gmem_read(2)
-  local side_level   = reaper.gmem_read(3)
+  local base = idx * 8
+  local duration = slot_changed and 0 or reaper.gmem_read(base + 4)
 
   return {
     trackIndex   = idx,
-    correlation  = correlation,
-    stereoWidth  = stereo_width,
-    midLevel     = mid_level,
-    sideLevel    = side_level,
+    correlation  = reaper.gmem_read(base + 0),
+    stereoWidth  = reaper.gmem_read(base + 1),
+    midLevel     = reaper.gmem_read(base + 2),
+    sideLevel    = reaper.gmem_read(base + 3),
+    duration     = duration,
+    measuring    = duration > 0,
   }
 end
 
@@ -1742,21 +1683,65 @@ function handlers.read_track_crest(params)
   local track = reaper.GetTrack(0, idx)
   if not track then return nil, "Track " .. idx .. " not found" end
 
-  local fx_idx, err = ensure_jsfx_on_track(track, MCP_CREST_FACTOR_FX_NAME)
-  if not fx_idx then return nil, err end
+  local fx, err, slot_changed = ensure_meter(track, idx, MCP_CREST_FACTOR_FX_NAME)
+  if not fx then return nil, err end
 
-  -- Read from gmem (JSFX writes here from @sample)
   reaper.gmem_attach("MCPCrestFactor")
-
-  local crest_factor = reaper.gmem_read(0)
-  local peak_level   = reaper.gmem_read(1)
-  local rms_level    = reaper.gmem_read(2)
+  local base = idx * 4
+  local duration = slot_changed and 0 or reaper.gmem_read(base + 3)
 
   return {
     trackIndex   = idx,
-    crestFactor  = crest_factor,
-    peakLevel    = peak_level,
-    rmsLevel     = rms_level,
+    crestFactor  = reaper.gmem_read(base + 0),
+    peakLevel    = reaper.gmem_read(base + 1),
+    rmsLevel     = reaper.gmem_read(base + 2),
+    duration     = duration,
+    measuring    = duration > 0,
+  }
+end
+
+function handlers.read_track_spectrum(params)
+  local idx = params.trackIndex
+  if idx == nil then return nil, "trackIndex required" end
+
+  local track = reaper.GetTrack(0, idx)
+  if not track then return nil, "Track " .. idx .. " not found" end
+
+  local fx, err, changed = ensure_meter(track, idx, MCP_ANALYZER_FX_NAME)
+  if not fx then return nil, err end
+
+  if params.fftSize then
+    local fft_changed, fft_err = set_mcp_jsfx_slider(track, fx, MCP_ANALYZER_FX_NAME, "FFT Size", params.fftSize)
+    if fft_changed == nil then return nil, fft_err end
+    changed = changed or fft_changed
+  end
+
+  reaper.gmem_attach("MCPAnalyzer")
+  local base = idx * 4104  -- slot stride in mcp_analyzer.jsfx
+  local frames = reaper.gmem_read(base + 4)
+  if changed or frames <= 0 then
+    return nil, "Spectrum analyzer has no data for this track yet. " .. NOT_READY_HINT
+  end
+
+  local bin_count = reaper.gmem_read(base + 0)
+  local sr = reaper.gmem_read(base + 3)  -- the rate the JSFX actually runs at (not the project setting)
+  local fft_size = bin_count * 2
+
+  local bins = {}
+  for i = 0, bin_count - 1 do
+    bins[#bins + 1] = reaper.gmem_read(base + 5 + i)
+  end
+
+  return {
+    trackIndex = idx,
+    fftSize = fft_size,
+    sampleRate = sr,
+    binCount = bin_count,
+    frequencyResolution = sr / fft_size,
+    peakDb = reaper.gmem_read(base + 1),
+    rmsDb = reaper.gmem_read(base + 2),
+    frames = frames,
+    bins = bins,
   }
 end
 
@@ -2803,12 +2788,7 @@ function handlers.set_multiple_track_properties(params)
   local tracks_input = params.tracks
   if not tracks_input then return nil, "tracks array required" end
 
-  local tracks = nil
-  if type(tracks_input) == "string" then
-    tracks = json_decode(tracks_input)
-  elseif type(tracks_input) == "table" then
-    tracks = tracks_input
-  end
+  local tracks = json_decode_array(tracks_input)
   if not tracks then return nil, "Failed to parse tracks array" end
 
   local updated = 0
@@ -2865,12 +2845,7 @@ function handlers.setup_fx_chain(params)
   local plugins_input = params.plugins
   if not plugins_input then return nil, "plugins array required" end
 
-  local plugins = nil
-  if type(plugins_input) == "string" then
-    plugins = json_decode(plugins_input)
-  elseif type(plugins_input) == "table" then
-    plugins = plugins_input
-  end
+  local plugins = json_decode_array(plugins_input)
   if not plugins then return nil, "Failed to parse plugins array" end
 
   local track = reaper.GetTrack(0, track_idx)
@@ -2898,8 +2873,9 @@ function handlers.setup_fx_chain(params)
 
         -- Set initial parameters if provided
         local param_errors = {}
-        if plugin.parameters and type(plugin.parameters) == "table" then
-          for _, p in ipairs(plugin.parameters) do
+        local parameters = plugin.parameters and json_decode_array(plugin.parameters)
+        if parameters then
+          for _, p in ipairs(parameters) do
             if p.index ~= nil and p.value ~= nil then
               local ok = reaper.TrackFX_SetParam(track, fx_idx, p.index, p.value)
               if not ok then
@@ -2942,12 +2918,7 @@ function handlers.set_multiple_fx_parameters(params)
   local updates_input = params.updates
   if not updates_input then return nil, "updates array required" end
 
-  local updates = nil
-  if type(updates_input) == "string" then
-    updates = json_decode(updates_input)
-  elseif type(updates_input) == "table" then
-    updates = updates_input
-  end
+  local updates = json_decode_array(updates_input)
   if not updates then return nil, "Failed to parse updates array" end
 
   local updated = 0
@@ -2980,9 +2951,11 @@ function handlers.set_multiple_fx_parameters(params)
 
   reaper.Undo_EndBlock("MCP: Batch set " .. updated .. " FX parameters", -1)
 
-  local result = { success = true, updated = updated, total = #updates }
-  if #errors > 0 then result.errors = errors end
-  return result
+  if updated < #updates or #updates == 0 then
+    return nil, "Set " .. updated .. " of " .. #updates .. " FX parameters" ..
+      (#errors > 0 and (": " .. table.concat(errors, "; ")) or "")
+  end
+  return { success = true, updated = updated, total = #updates }
 end
 
 -- =============================================================================

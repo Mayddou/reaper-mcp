@@ -69,8 +69,6 @@ describe('protocol exports', () => {
       trackIndex: 0,
       peakL: -12,
       peakR: -12,
-      rmsL: -18,
-      rmsR: -18,
     };
     expect(meters.trackIndex).toBe(0);
   });

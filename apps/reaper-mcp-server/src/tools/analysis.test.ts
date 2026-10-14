@@ -252,4 +252,36 @@ describe('analysis tools', () => {
       });
     });
   });
+
+  describe('measure_tracks', () => {
+    it('arms meters (LUFS reset) after play and before reading, and reports read errors', async () => {
+      const calls: string[] = [];
+      mockedSendCommand.mockImplementation(async (type, params) => {
+        const p = params as { trackIndex?: number; reset?: boolean };
+        calls.push(`${type}${p.reset ? ':reset' : ''}`);
+        if (type === 'get_transport_state') return { id: 't', success: true, data: { playing: false, playPosition: 1 }, timestamp: 0 };
+        if (type === 'read_track_crest') return { id: 't', success: false, error: 'no data', timestamp: 0 };
+        if (type === 'read_track_lufs') return { id: 't', success: true, data: { trackIndex: p.trackIndex, integrated: -14 }, timestamp: 0 };
+        return { id: 't', success: true, data: {}, timestamp: 0 };
+      });
+
+      const result = (await tools['measure_tracks'].handler({
+        trackIndices: [0, 1], metrics: ['lufs', 'crest'], durationSeconds: 1, fftSize: 4096, stopWhenDone: true,
+      })) as { content: Array<{ text: string }> };
+
+      // play -> prime (lufs with reset) -> final reads (no reset) -> stop
+      const play = calls.indexOf('play');
+      const firstReset = calls.indexOf('read_track_lufs:reset');
+      const firstPlainLufs = calls.indexOf('read_track_lufs');
+      expect(play).toBeGreaterThanOrEqual(0);
+      expect(firstReset).toBeGreaterThan(play);
+      expect(calls.filter((c) => c === 'read_track_lufs:reset')).toHaveLength(2);
+      expect(firstPlainLufs).toBeGreaterThan(firstReset);
+      expect(calls.at(-1)).toBe('stop');
+
+      const out = JSON.parse(result.content[0].text);
+      expect(out.tracks[1].lufs).toEqual({ trackIndex: 1, integrated: -14 });
+      expect(out.tracks[1].errors).toEqual({ crest: 'no data' });
+    });
+  });
 });

@@ -4,19 +4,23 @@ desc:MCP Crest Factor Meter
 // Higher crest factor = more dynamic (less compressed).
 // Writes results to shared memory (gmem) so the Lua bridge can read them.
 //
-// gmem layout:
-//   gmem[0] = crest factor (dB) = peak level - RMS level
-//   gmem[1] = peak level (dB)
-//   gmem[2] = RMS level (dB)
+// Each instance writes to its own slot so several tracks can be metered at once.
+// gmem layout (per track slot):
+//   base = track_slot * 4
+//   gmem[base+0] = crest factor (dB) = peak level - RMS level
+//   gmem[base+1] = peak level (dB)
+//   gmem[base+2] = RMS level (dB)
+//   gmem[base+3] = measurement duration (seconds since last reset, 0 = no data yet)
 
 options:gmem=MCPCrestFactor
 
 slider1:window_ms=1000<100,5000,100>Window (ms)
 slider2:peak_hold_ms=1000<100,10000,100>Peak Hold (ms)
+slider3:track_slot=0<0,1023,1>Track Slot
 
 @init
   // Ring buffer for squared samples (RMS window)
-  buf_sq   = 0;      // squared mono samples
+  buf_sq   = 0;      // per-sample L/R mean square
   buf_size = 0;      // set from sample rate at runtime
   buf_pos  = 0;
   sum_sq   = 0;
@@ -42,16 +46,18 @@ slider2:peak_hold_ms=1000<100,10000,100>Peak Hold (ms)
     peak_val = 0;
     peak_hold_samples = ceil(srate * peak_hold_ms / 1000);
     peak_hold_pos = 0;
+    sample_count = 0;
     needs_init = 0;
-    gmem[0] = 0;
-    gmem[1] = -150;
-    gmem[2] = -150;
+    base = floor(track_slot + 0.5) * 4;
+    gmem[base+0] = 0;
+    gmem[base+1] = -150;
+    gmem[base+2] = -150;
+    gmem[base+3] = 0;
   );
 
-  // Mono mix for metering
-  mono = (spl0 + spl1) * 0.5;
-  sq   = mono * mono;
-  peak_abs = abs(mono);
+  // Per-channel metering (a mono sum would hide side/anti-phase content)
+  sq   = (spl0 * spl0 + spl1 * spl1) * 0.5;
+  peak_abs = max(abs(spl0), abs(spl1));
 
   // --- RMS ring buffer ---
   sum_sq -= buf_sq[buf_pos];
@@ -59,6 +65,7 @@ slider2:peak_hold_ms=1000<100,10000,100>Peak Hold (ms)
   sum_sq += sq;
   buf_pos += 1;
   buf_pos >= buf_size ? buf_pos = 0;
+  sample_count += 1;
 
   // --- Peak hold ---
   peak_abs > peak_val ? (
@@ -97,9 +104,10 @@ slider2:peak_hold_ms=1000<100,10000,100>Peak Hold (ms)
       crest_db = 0;
     );
 
-    gmem[0] = crest_db;
-    gmem[1] = peak_db;
-    gmem[2] = rms_db;
+    gmem[base+0] = crest_db;
+    gmem[base+1] = peak_db;
+    gmem[base+2] = rms_db;
+    gmem[base+3] = sample_count / srate;
   );
 
   // Pass audio through unmodified

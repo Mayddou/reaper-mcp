@@ -291,7 +291,7 @@ The `knowledge/` directory and `apps/reaper-mix-agent/` are tightly coupled:
 
 | Tool | File | Description |
 |------|------|-------------|
-| `read_track_meters` | `tools/meters.ts` | Peak/RMS L/R in dB |
+| `read_track_meters` | `tools/meters.ts` | Peak L/R in dB (RMS: use `read_track_crest`) |
 | `read_track_spectrum` | `tools/meters.ts` | FFT frequency bins (auto-inserts JSFX analyzer) |
 | `read_track_lufs` | `tools/analysis.ts` | Integrated/short-term/momentary LUFS + true peak |
 | `read_track_correlation` | `tools/analysis.ts` | Stereo correlation, width, mid/side levels |
@@ -495,8 +495,11 @@ The sidecar architecture admits new JSON-RPC methods easily — future phases (C
 
 The JSFX analyzer (`mcp_analyzer.jsfx`) runs in REAPER's audio thread:
 - Performs configurable FFT (512-8192 bins, default 4096)
-- Writes magnitude spectrum to `gmem[]` under namespace `MCPAnalyzer`
-- gmem layout: `[bin_count, peak_dB, rms_dB, bin[0], bin[1], ...]`
+- Writes magnitude spectrum to `gmem[]` under namespace `MCPAnalyzer`, one slot per track
+- gmem layout: `base = trackIndex * 4104`; `[bin_count, peak_dB, rms_dB, srate, frames, bin[0], bin[1], ...]`
+- All meter JSFX (analyzer, LUFS, crest, correlation) take a `Track Slot` slider; the bridge sets it
+  to the track index after verifying (by `fx_ident`) that the FX is the MCP JSFX, so meters on
+  different tracks never share gmem and no write can land on a user plugin
 - Lua bridge reads via `reaper.gmem_attach("MCPAnalyzer")` + `reaper.gmem_read()`
 - Auto-inserted by `read_track_spectrum` tool, passes audio through unmodified
 

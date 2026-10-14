@@ -122,8 +122,6 @@ export interface TrackMeters {
   trackIndex: number;
   peakL: number;  // dB
   peakR: number;  // dB
-  rmsL: number;   // dB
-  rmsR: number;   // dB
 }
 
 export interface TrackSpectrum {
@@ -134,7 +132,8 @@ export interface TrackSpectrum {
   frequencyResolution: number; // Hz per bin
   peakDb: number;
   rmsDb: number;
-  /** Magnitude in dB for each frequency bin, from 0 Hz to Nyquist */
+  frames?: number;            // FFT frames analysed since the analyzer was (re)armed
+  /** Magnitude in dB for each frequency bin, from 0 Hz to Nyquist (a sine of amplitude A reads 20*log10(A)) */
   bins: number[];
 }
 
@@ -201,6 +200,7 @@ export interface LufsData {
   truePeakL: number;    // dBTP (inter-sample peak, left channel)
   truePeakR: number;    // dBTP (inter-sample peak, right channel)
   duration: number;     // seconds since measurement start
+  measuring?: boolean;  // false until the meter has data for this track
 }
 
 export interface CorrelationData {
@@ -209,6 +209,8 @@ export interface CorrelationData {
   stereoWidth: number;  // 0.0 (mono) to 2.0 (very wide), 1.0 = normal stereo
   midLevel: number;     // dB (mid channel RMS)
   sideLevel: number;    // dB (side channel RMS)
+  duration?: number;    // seconds of audio measured since the meter was (re)armed
+  measuring?: boolean;  // false until the meter has data for this track
 }
 
 export interface CrestFactorData {
@@ -216,6 +218,8 @@ export interface CrestFactorData {
   crestFactor: number;  // dB (peak - RMS); higher = more dynamic
   peakLevel: number;    // dB (peak hold level)
   rmsLevel: number;     // dB (RMS level over window)
+  duration?: number;    // seconds of audio measured since the meter was (re)armed
+  measuring?: boolean;  // false until the meter has data for this track
 }
 
 // --- MIDI editing response types ---
@@ -385,6 +389,8 @@ export interface TrackMeasurement {
   crest?: CrestFactorData;
   correlation?: CorrelationData;
   spectrum?: TrackSpectrum;
+  /** Per-metric read errors (metric name -> message) */
+  errors?: Record<string, string>;
 }
 
 export interface MeasureTracksResult {

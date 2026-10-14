@@ -5,7 +5,7 @@ import { sendCommand } from '../bridge.js';
 export function registerMeterTools(server: McpServer): void {
   server.tool(
     'read_track_meters',
-    'Read real-time peak and RMS levels (in dB) for a track. Returns L/R peak and RMS values.',
+    'Read real-time L/R peak levels (in dB) for a track. For RMS / crest factor use read_track_crest.',
     {
       trackIndex: z.coerce.number().int().min(0).describe('Zero-based track index'),
     },

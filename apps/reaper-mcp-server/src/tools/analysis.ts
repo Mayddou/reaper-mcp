@@ -1,7 +1,7 @@
 import { z } from 'zod/v4';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { sendCommand } from '../bridge.js';
-import type { TrackMeasurement } from '@reaper-mcp/protocol';
+import type { CommandType, TrackMeasurement } from '@reaper-mcp/protocol';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -13,9 +13,10 @@ export function registerAnalysisTools(server: McpServer): void {
     'Read ITU-R BS.1770 loudness data for a track. Auto-inserts the MCP LUFS Meter JSFX if not present. Returns integrated, short-term (3s), and momentary (400ms) LUFS plus true inter-sample peak levels. Audio must be playing to accumulate data.',
     {
       trackIndex: z.coerce.number().int().min(0).describe('Zero-based track index'),
+      reset: z.boolean().optional().describe('Restart the measurement (integrated LUFS, true peak) before reading'),
     },
-    async ({ trackIndex }) => {
-      const res = await sendCommand('read_track_lufs', { trackIndex });
+    async ({ trackIndex, reset }) => {
+      const res = await sendCommand('read_track_lufs', reset ? { trackIndex, reset } : { trackIndex });
       if (!res.success) {
         return { content: [{ type: 'text', text: `Error: ${res.error}` }], isError: true };
       }
@@ -55,7 +56,7 @@ export function registerAnalysisTools(server: McpServer): void {
 
   server.tool(
     'measure_tracks',
-    'Play audio and collect analysis measurements (LUFS, crest factor, correlation, spectrum) for one or more tracks in a single call. Handles playback start/stop automatically. LUFS supports multi-track; crest/correlation/spectrum use global gmem and are only reliable for single-track measurement. First call may be slower due to JSFX meter auto-insertion.',
+    'Play audio and collect analysis measurements (LUFS, crest factor, correlation, spectrum) for one or more tracks in a single call. Handles playback start/stop automatically. Meters are inserted (inside an "MCP Meters" container) and reset once playback has started, so every reading covers the measurement window; each track has its own meter slot. Read-only for the user\'s plugins.',
     {
       trackIndices: z.array(z.coerce.number().int().min(0)).min(1).max(8)
         .describe('Track indices to measure (max 8)'),
@@ -71,6 +72,15 @@ export function registerAnalysisTools(server: McpServer): void {
         .describe('Stop playback after measuring'),
     },
     async ({ trackIndices, metrics, durationSeconds, startPosition, fftSize, stopWhenDone }) => {
+      const commandFor = (metric: string): { type: CommandType; extra: Record<string, unknown> } | null => {
+        switch (metric) {
+          case 'lufs': return { type: 'read_track_lufs', extra: {} };
+          case 'crest': return { type: 'read_track_crest', extra: {} };
+          case 'correlation': return { type: 'read_track_correlation', extra: {} };
+          case 'spectrum': return { type: 'read_track_spectrum', extra: { fftSize } };
+          default: return null;
+        }
+      };
       try {
         // Check current transport state
         const transportRes = await sendCommand('get_transport_state', {});
@@ -84,6 +94,20 @@ export function registerAnalysisTools(server: McpServer): void {
           await sendCommand('play', {});
         }
 
+        // Arm the meters now that audio is running: inserts any missing JSFX, assigns
+        // each track its own gmem slot and resets LUFS so pre-roll silence isn't counted.
+        // These priming reads are expected to report "no data yet" and are discarded.
+        await Promise.all(
+          trackIndices.flatMap((trackIndex) =>
+            metrics.map((metric) => {
+              const cmd = commandFor(metric);
+              if (!cmd) return Promise.resolve(null);
+              const reset = metric === 'lufs' ? { reset: true } : {};
+              return sendCommand(cmd.type, { trackIndex, ...cmd.extra, ...reset });
+            })
+          )
+        );
+
         // Wait for measurement accumulation
         await sleep(durationSeconds * 1000);
 
@@ -96,31 +120,12 @@ export function registerAnalysisTools(server: McpServer): void {
 
         for (const trackIndex of trackIndices) {
           for (const metric of metrics) {
-            let commandType: string;
-            const params: Record<string, unknown> = { trackIndex };
-
-            switch (metric) {
-              case 'lufs':
-                commandType = 'read_track_lufs';
-                break;
-              case 'crest':
-                commandType = 'read_track_crest';
-                break;
-              case 'correlation':
-                commandType = 'read_track_correlation';
-                break;
-              case 'spectrum':
-                commandType = 'read_track_spectrum';
-                params.fftSize = fftSize;
-                break;
-              default:
-                continue;
-            }
-
+            const cmd = commandFor(metric);
+            if (!cmd) continue;
             measurementPromises.push({
               trackIndex,
               metric,
-              promise: sendCommand(commandType as Parameters<typeof sendCommand>[0], params),
+              promise: sendCommand(cmd.type, { trackIndex, ...cmd.extra }),
             });
           }
         }
@@ -151,8 +156,11 @@ export function registerAnalysisTools(server: McpServer): void {
         }
 
         for (const { trackIndex, metric, result } of results) {
-          if (!result.success) continue;
           const measurement = trackMap.get(trackIndex)!;
+          if (!result.success) {
+            (measurement.errors ??= {})[metric] = result.error ?? 'unknown error';
+            continue;
+          }
           switch (metric) {
             case 'lufs':
               measurement.lufs = result.data as TrackMeasurement['lufs'];
