@@ -17,3 +17,4 @@ lesson schema, entrenchment guards, and the promotion/self-heal flow are in
 ## Lessons
 
 <!-- - [short title](entries/2026-06-28-slug.md) — one-line takeaway [seen:1] -->
+- [Analysis tools clobbered plugins — snapshot before any metering](entries/2026-10-14-mcp-lufs-clobbers-plugins.md) — reaper-mcp LUFS reads wrote idx/127 into user plugin param 1; snapshot first, skip LUFS until bridge fixed [seen:1]
