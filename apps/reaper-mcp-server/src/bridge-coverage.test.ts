@@ -77,3 +77,27 @@ describe('bridge coverage', () => {
     expect(missing, `Missing from MCP_TOOL_NAMES: ${missing.join(', ')}`).toEqual([]);
   });
 });
+
+describe('FX parameter value contract', () => {
+  // Tools document `value` as normalized 0.0–1.0. TrackFX_SetParam takes native
+  // units (e.g. ReaComp threshold is 0..2), so setters must use the Normalized API.
+  const lua = readFileSync(join(__dirname, '../../../reaper/mcp_bridge.lua'), 'utf-8');
+  const body = (name: string) => {
+    const m = lua.match(new RegExp(`function handlers\\.${name}\\s*\\([\\s\\S]*?\\nend\\n`));
+    if (!m) throw new Error(`handler ${name} not found`);
+    return m[0];
+  };
+
+  it.each(['set_fx_parameter', 'set_multiple_fx_parameters', 'setup_fx_chain'])(
+    '%s writes normalized values',
+    (name) => {
+      expect(body(name)).toContain('TrackFX_SetParamNormalized(');
+      expect(body(name)).not.toMatch(/TrackFX_SetParam\(/);
+    },
+  );
+
+  it.each(['get_fx_parameters', 'analyze_fx'])('%s reports normalized value + nativeValue', (name) => {
+    expect(body(name)).toContain('TrackFX_GetParamNormalized(');
+    expect(body(name)).toMatch(/value = norm,\s*nativeValue = val,/);
+  });
+});

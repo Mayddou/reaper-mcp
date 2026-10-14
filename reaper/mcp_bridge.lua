@@ -348,7 +348,7 @@ local function analyze_eq_bands(all_params, param_count)
       elseif name_lower:find("gain") and not name_lower:find("side")
              and not name_lower:find("dynamic") then
         b.gain = par.formattedValue
-        b.gain_val = par.value
+        b.gain_val = par.nativeValue
         b.gain_min = par.minValue
         b.gain_max = par.maxValue
       elseif name_lower:match("^%d+ q$") or name_lower:match("band %d+ q$")
@@ -671,6 +671,7 @@ function handlers.get_fx_parameters(params)
   for p = 0, param_count - 1 do
     local _, pname = reaper.TrackFX_GetParamName(track, fx_idx, p)
     local val, min_val, max_val = reaper.TrackFX_GetParam(track, fx_idx, p)
+    local norm = reaper.TrackFX_GetParamNormalized(track, fx_idx, p)
     local _, formatted = reaper.TrackFX_GetFormattedParamValue(track, fx_idx, p)
 
     local include = true
@@ -689,7 +690,8 @@ function handlers.get_fx_parameters(params)
       matched[#matched + 1] = {
         index = p,
         name = pname,
-        value = val,
+        value = norm,
+        nativeValue = val,
         formattedValue = formatted or "",
         minValue = min_val,
         maxValue = max_val,
@@ -755,11 +757,13 @@ function handlers.analyze_fx(params)
   for p = 0, param_count - 1 do
     local _, pname = reaper.TrackFX_GetParamName(track, fx_idx, p)
     local val, min_val, max_val = reaper.TrackFX_GetParam(track, fx_idx, p)
+    local norm = reaper.TrackFX_GetParamNormalized(track, fx_idx, p)
     local _, formatted = reaper.TrackFX_GetFormattedParamValue(track, fx_idx, p)
     all_params[p] = {
       index = p,
       name = pname or "",
-      value = val,
+      value = norm,
+      nativeValue = val,
       formattedValue = formatted or "",
       minValue = min_val,
       maxValue = max_val,
@@ -777,7 +781,7 @@ function handlers.analyze_fx(params)
       local par = all_params[p]
       local name_lower = par.name:lower()
       if not name_lower:find("band") and not name_lower:match("^%d+ ")
-         and is_param_non_default(par.value, par.minValue, par.maxValue, par.formattedValue) then
+         and is_param_non_default(par.nativeValue, par.minValue, par.maxValue, par.formattedValue) then
         notable[#notable + 1] = {
           index = par.index, name = par.name,
           value = par.value, formattedValue = par.formattedValue,
@@ -796,7 +800,7 @@ function handlers.analyze_fx(params)
     for p = 0, param_count - 1 do
       local par = all_params[p]
       if not core_names[p]
-         and is_param_non_default(par.value, par.minValue, par.maxValue, par.formattedValue) then
+         and is_param_non_default(par.nativeValue, par.minValue, par.maxValue, par.formattedValue) then
         notable[#notable + 1] = {
           index = par.index, name = par.name,
           value = par.value, formattedValue = par.formattedValue,
@@ -807,7 +811,7 @@ function handlers.analyze_fx(params)
     -- Generic: return all non-default params
     for p = 0, param_count - 1 do
       local par = all_params[p]
-      if is_param_non_default(par.value, par.minValue, par.maxValue, par.formattedValue) then
+      if is_param_non_default(par.nativeValue, par.minValue, par.maxValue, par.formattedValue) then
         notable[#notable + 1] = {
           index = par.index, name = par.name,
           value = par.value, formattedValue = par.formattedValue,
@@ -843,7 +847,7 @@ function handlers.set_fx_parameter(params)
   if not track then return nil, "Track " .. idx .. " not found" end
 
   reaper.Undo_BeginBlock()
-  local ok = reaper.TrackFX_SetParam(track, fx_idx, param_idx, value)
+  local ok = reaper.TrackFX_SetParamNormalized(track, fx_idx, param_idx, value)
   if not ok then
     reaper.Undo_EndBlock("MCP: Set FX parameter (failed)", -1)
     return nil, "Failed to set param " .. param_idx .. " on FX " .. fx_idx
@@ -2901,7 +2905,7 @@ function handlers.setup_fx_chain(params)
         if plugin.parameters and type(plugin.parameters) == "table" then
           for _, p in ipairs(plugin.parameters) do
             if p.index ~= nil and p.value ~= nil then
-              local ok = reaper.TrackFX_SetParam(track, fx_idx, p.index, p.value)
+              local ok = reaper.TrackFX_SetParamNormalized(track, fx_idx, p.index, p.value)
               if not ok then
                 param_errors[#param_errors + 1] = "Failed to set param " .. p.index
               end
@@ -2968,7 +2972,7 @@ function handlers.set_multiple_fx_parameters(params)
       if not track then
         errors[#errors + 1] = "Track " .. track_idx .. " not found"
       else
-        local ok = reaper.TrackFX_SetParam(track, fx_idx, param_idx, value)
+        local ok = reaper.TrackFX_SetParamNormalized(track, fx_idx, param_idx, value)
         if not ok then
           errors[#errors + 1] = "Failed to set track " .. track_idx .. " fx " .. fx_idx .. " param " .. param_idx
         else

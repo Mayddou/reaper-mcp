@@ -38,7 +38,7 @@ export function registerFxTools(server: McpServer): void {
 
   server.tool(
     'get_fx_parameters',
-    'List parameters of an FX plugin with current values and ranges. Supports filtering by name pattern, changed-only filter, and pagination. For a quick summary of active EQ bands or compressor settings, use analyze_fx instead.',
+    'List parameters of an FX plugin with current values and ranges. `value` is normalized 0.0–1.0 (the scale every set_* FX tool takes); `nativeValue`/`minValue`/`maxValue` are the plugin\'s native units; `formattedValue` is the display string. Supports filtering by name pattern, changed-only filter, and pagination. For a quick summary of active EQ bands or compressor settings, use analyze_fx instead.',
     {
       trackIndex: z.coerce.number().int().min(0).describe('Zero-based track index'),
       fxIndex: z.coerce.number().int().min(0).describe('Zero-based FX index in the chain'),
@@ -76,12 +76,12 @@ export function registerFxTools(server: McpServer): void {
 
   server.tool(
     'set_fx_parameter',
-    'Set a specific FX parameter value (normalized 0.0–1.0)',
+    'Set a specific FX parameter value (normalized 0.0–1.0, same scale as `value` from get_fx_parameters). Read formattedValue back to confirm the real-world setting.',
     {
       trackIndex: z.coerce.number().int().min(0).describe('Zero-based track index'),
       fxIndex: z.coerce.number().int().min(0).describe('Zero-based FX index in the chain'),
       paramIndex: z.coerce.number().int().min(0).describe('Zero-based parameter index'),
-      value: z.coerce.number().min(0).max(1).describe('Normalized parameter value 0.0–1.0'),
+      value: z.coerce.number().min(0).max(1).describe('Normalized parameter value 0.0–1.0 (same scale as `value` from get_fx_parameters, not the native min/max range)'),
     },
     async ({ trackIndex, fxIndex, paramIndex, value }) => {
       const res = await sendCommand('set_fx_parameter', { trackIndex, fxIndex, paramIndex, value });

@@ -61,9 +61,10 @@ export interface FxInfo {
 export interface FxParameterInfo {
   index: number;
   name: string;
-  value: number;          // normalized 0.0–1.0
+  value: number;          // normalized 0.0–1.0 (scale used by all FX setters)
+  nativeValue: number;    // plugin-native units, within minValue..maxValue
   formattedValue: string; // human-readable (e.g. "-6.0 dB")
-  minValue: number;
+  minValue: number;       // native range
   maxValue: number;
 }
 

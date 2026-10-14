@@ -126,8 +126,9 @@ loudness/limiting, defer to `/mastering`.
   action* and say you did. Never end a session that had a correction without a
   written lesson. (Invariant — the loop's whole value depends on it.)
 - **Don't guess plugin names** — `search_fx` for the exact name.
-- **Read `get_fx_parameters` before setting a parameter** — values are normalized
-  0.0–1.0 and the mapping varies per plugin.
+- **Read `get_fx_parameters` before setting a parameter** — setters take the
+  normalized `value` (0.0–1.0), never `nativeValue`/`minValue`/`maxValue`; the
+  mapping varies per plugin, so confirm via `formattedValue` after setting.
 - **Meters are instantaneous** — play audio a few seconds before reading.
 - **Keep bass mono below ~100 Hz** — check `read_track_correlation` on the bus
   before any widening.
